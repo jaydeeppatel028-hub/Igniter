@@ -24,7 +24,7 @@
   // HOME
   // ==================================================================
   App.route("home", async (el, _p, token) => {
-    const [stats, lb] = await Promise.all([App.rpc("get_home_stats"), App.rpc("get_leaderboard", { p_week: null })]);
+    const [stats, lb] = await Promise.all([App.cachedRpc("get_home_stats"), App.cachedRpc("get_leaderboard", { p_week: null })]);
     if (App.stale(token)) return;
     const s = App.settings, today = App.todayISO();
     const cw = stats.current_week;
@@ -44,6 +44,7 @@
         </div>
       </section>
       <div class="notice">Welcome, <b>${esc(me.full_name)}</b>! ${App.isAdmin() ? 'You are logged in as <b>Admin</b>.' : ""}</div>
+      ${me.default_password ? `<a class="notice warn" href="#/profile" style="display:block;text-decoration:none">🔑 You are using the starting password. For your security, please <b>change your password</b> (tap here → Change Password).</a>` : ""}
       <div class="stat-grid">
         <div class="stat blue"><div class="k">Current Week</div><div class="v">${weekText}</div></div>
         <div class="stat accent"><div class="k">${daysLabel}</div><div class="v">${daysVal}</div></div>
@@ -83,6 +84,8 @@
     { k: "attendance", l: "Attendance" },
     { k: "activities", l: "Activities" },
     { k: "challenges", l: "Special Challenge", pts: "challenge_points" },
+    { k: "group_organized", l: "Group Mtg Organized" },
+    { k: "group_attended", l: "Group Mtg Attended" },
   ];
   App.LB_COLS = LB_COLS;
   const lbState = { week: null, search: "", sort: "total_points", dir: -1, data: {} };
@@ -114,7 +117,8 @@
       const key = lbState.week || "all";
       if (force || !lbState.data[key]) {
         App.$("#lb-body", el).innerHTML = App.loadingHTML;
-        lbState.data[key] = await App.rpc("get_leaderboard", { p_week: lbState.week });
+        if (force) App.clearCache();
+        lbState.data[key] = await App.cachedRpc("get_leaderboard", { p_week: lbState.week });
       }
       draw();
     };
@@ -180,10 +184,11 @@
         { k: "biz_received_amount", l: "Business Received (Rs)" }, { k: "biz_received_points", l: "Business Received Points" },
         { k: "visitors", l: "Visitors" }, { k: "inductions", l: "Inductions" }, { k: "attendance", l: "Attendance" },
         { k: "activities", l: "Activity Participation" }, { k: "challenges", l: "Special Challenges" }, { k: "challenge_points", l: "Challenge Points" },
+        { k: "group_organized", l: "Group Meetings Organized" }, { k: "group_attended", l: "Group Meetings Attended" },
       ]);
     };
-    lbState.data = {};           // always fresh when page opens
-    await load(true);
+    lbState.data = {};
+    await load(false);
   };
 
   App.route("leaderboard", async (el) => {
@@ -197,12 +202,13 @@
   // ==================================================================
   // MY PERFORMANCE (dashboard + point history)
   // ==================================================================
-  const CARD_ORDER = ["p2p", "new_member", "ref_given", "ref_received", "biz_given", "biz_received", "visitor", "induction", "attendance", "activity", "challenge"];
+  const CARD_ORDER = ["p2p", "new_member", "ref_given", "ref_received", "biz_given", "biz_received", "visitor", "induction", "attendance", "activity", "challenge", "group_organize", "group_attend"];
 
   App.txnDetails = (t, opts) => {
     opts = opts || {};
     const parts = [];
     if (t.partner_id) parts.push(`With: <b>${esc(App.memberName(t.partner_id))}</b>`);
+    if (t.partner_name) parts.push(`With: <b>${esc(t.partner_name)}</b>${t.partner_wing ? ` (${esc(t.partner_wing)})` : ""}`);
     if (t.amount != null && /^biz_/.test(t.category)) parts.push(`Amount: <b>${App.fmtINR(t.amount)}</b>`);
     if (t.customer_name) parts.push(`Customer: ${esc(t.customer_name)}`);
     if (t.description) parts.push(esc(t.description));
@@ -213,13 +219,12 @@
 
   App.route("me", async (el, _p, token) => {
     const me = App.profile;
-    const [txns, lbAll] = await Promise.all([
-      App.q(App.sb.from("v_transactions").select("*").eq("member_id", me.id).order("txn_date", { ascending: false }).order("id", { ascending: false })),
-      App.rpc("get_leaderboard", { p_week: null }),
-    ]);
-    if (App.stale(token)) return;
     const cw = App.currentWeek();
-    const lbWeek = cw ? await App.rpc("get_leaderboard", { p_week: cw }) : [];
+    const [txns, lbAll, lbWeek] = await Promise.all([
+      App.q(App.sb.from("v_transactions").select("*").eq("member_id", me.id).order("txn_date", { ascending: false }).order("id", { ascending: false })),
+      App.cachedRpc("get_leaderboard", { p_week: null }),
+      cw ? App.cachedRpc("get_leaderboard", { p_week: cw }) : Promise.resolve([]),
+    ]);
     if (App.stale(token)) return;
     const mine = (lbAll || []).find((r) => r.member_id === me.id) || { rank: "—", total_points: 0 };
     const mineW = (lbWeek || []).find((r) => r.member_id === me.id);
@@ -255,12 +260,13 @@
       App.$("#hist", el).innerHTML = list.length ? `<table class="rt"><thead><tr><th>Date</th><th>Activity</th><th>Details</th><th>Points</th><th>Status</th><th></th></tr></thead><tbody>
         ${list.map((t) => `<tr>
           <td data-label="Date" class="nowrap">${App.fmtDate(t.txn_date)}<div class="small muted">${t.week_no ? "Week " + t.week_no : "Outside league"}</div></td>
-          <td data-label="Activity">${App.catIcon(t.category)} ${esc(App.catLabel(t.category))}</td>
+          <td data-label="Activity">${App.catIcon(t.category)} ${esc(App.txnLabel(t))}</td>
           <td data-label="Details"><div>${App.txnDetails(t) || "—"}</div></td>
           <td data-label="Points" class="nowrap">${t.status === "rejected" ? '<span class="muted">0</span>' : `<span class="pts-badge">+${t.points}</span>`}${t.status === "pending" ? '<div class="small muted">if approved</div>' : ""}</td>
           <td data-label="Status">${App.statusTag(t.status)}</td>
           <td data-label="" class="no-label nowrap">
             ${t.photo_path ? `<button class="btn ghost sm" data-photo="${esc(t.photo_path)}">📷 Photo</button>` : ""}
+            ${t.app_screenshot_path ? `<button class="btn ghost sm" data-photo="${esc(t.app_screenshot_path)}">📱 GPBO screenshot</button>` : ""}
             ${t.doc_path ? `<button class="btn ghost sm" data-photo="${esc(t.doc_path)}">📎 Document</button>` : ""}
             ${t.status === "pending" ? `<button class="btn ghost sm red-text" data-withdraw="${t.id}">Withdraw</button>` : ""}</td>
         </tr>`).join("")}</tbody></table>` : '<div class="empty">No entries yet. Tap “Submit Activity” to add your first one!</div>';
@@ -282,19 +288,19 @@
   // SUBMIT ACTIVITY
   // ==================================================================
   const TYPES = [
-    { t: "p2p", icon: "🤝", l: "P2P Meeting", pts: () => App.pointsText("p2p") },
+    { t: "p2p", icon: "🤝", l: "P2P Meeting", pts: () => `Inside wing ${App.pointsText("p2p")} · Outside wing ${App.pointsText("p2p_outside")}` },
     { t: "new_member", icon: "🌱", l: "New Member Connection", pts: () => App.pointsText("new_member") },
     { t: "reference", icon: "📤", l: "Reference", pts: () => `Given ${App.pointsText("ref_given")} · Received ${App.pointsText("ref_received")}` },
     { t: "business", icon: "💼", l: "Business", pts: () => App.pointsText("biz_given") },
     { t: "visitor", icon: "🙋", l: "Visitor", pts: () => `${App.pointsText("visitor")} (+${(App.rulesMap.induction || {}).points || 100} if inducted)` },
-    { t: "challenge", icon: "⚡", l: "Special Challenge", pts: () => "10 – 30 pts" },
+    { t: "challenge", icon: "⚡", l: "Special Challenge", pts: () => "up to 150 pts" },
   ];
 
   const HELP = {
-    p2p: "A proper <b>one-to-one business meeting</b> with another member to understand each other's business, requirements, customer profile and how you can support each other. <b>Casual talk during the regular meeting does not count.</b> A photograph of the meeting is required.",
+    p2p: "A proper <b>one-to-one business meeting</b> with another member to understand each other's business, requirements, customer profile and how you can support each other. <b>Casual talk during the regular meeting does not count.</b> A photograph of the meeting and a screenshot of the P2P entry in the GPBO app are required.",
     new_member: "Meeting a <b>newly / recently inducted member</b> and understanding their business, ideal customer and requirements. Only members marked as “new” appear in the list.",
-    reference: "A <b>genuine</b> business reference / opportunity. Choose whether you <b>gave</b> it to a member or <b>received</b> it from a member.",
-    business: "<b>Actual business</b> done. Points = 1 for every full ₹50,000 (e.g. ₹2,50,000 = 5 points; ₹49,999 = 0 points).",
+    reference: "A <b>genuine</b> business reference / opportunity. Choose whether you <b>gave</b> it or <b>received</b> it. The other person can be an <b>Igniter member</b> or a <b>GPBO member of another wing</b>.",
+    business: "<b>Actual business</b> done with an <b>Igniter member</b> or a <b>GPBO member of another wing</b>. Points are calculated automatically from the amount (see below).",
     visitor: "A <b>qualified visitor</b> you brought to an official Igniter / GPBO meeting or event. If the visitor later joins GPBO, the Admin will add the induction bonus to you.",
     challenge: "Completed one of the Admin's special challenges? Claim it here. The Admin will verify and approve.",
   };
@@ -316,7 +322,7 @@
       <h2>➕ Submit Activity</h2>
       ${closedMsg ? `<div class="notice warn">${esc(closedMsg)}</div>` : ""}
       <div class="type-grid mb">${TYPES.map((x) => `<button type="button" class="type-tile ${type === x.t ? "active" : ""}" data-t="${x.t}"><span class="ic">${x.icon}</span><b>${x.l}</b><span>${esc(x.pts())}</span></button>`).join("")}</div>
-      <p class="small muted">Meeting Attendance and Activity Participation are marked by the Admin — you do not need to submit them.</p>
+      <p class="small muted">Meeting Attendance, Activity Participation and Group Meetings are marked by the Admin — you do not need to submit them.</p>
       <div id="form-area"></div>`;
     App.$$(".type-tile", el).forEach((b) => (b.onclick = () => App.go("#/submit/" + b.dataset.t)));
     if (!type || !HELP[type]) return;
@@ -324,6 +330,38 @@
     await buildForm(area, type);
     area.scrollIntoView({ behavior: "smooth", block: "start" });
   }, { member: true });
+
+  // A photo upload box with preview (works with phone camera / gallery)
+  const photoPicker = (key, label, required, btnText, hint) => `
+    <div class="f"><span style="display:block;font-weight:600;font-size:.9rem;margin-bottom:5px">${label} ${required ? '<em style="color:var(--red);font-style:normal">*</em>' : '<span class="muted">(optional)</span>'}</span>
+      <div class="photo-drop" data-key="${key}"><input type="file" accept="image/jpeg,image/png,image/webp" class="hidden">
+        <button type="button" class="btn ghost">${btnText}</button>
+        <div class="small muted mt">${hint}</div>
+        <img class="hidden" alt="Preview"></div></div>`;
+
+  // Labels for the "other person" field: [Igniter member label, other-wing label]
+  const PARTNER_LABELS = {
+    ref_given: ["Reference given to (Igniter member)", "Reference given to (GPBO member of another wing)"],
+    ref_received: ["Reference received from (Igniter member)", "Reference received from (GPBO member of another wing)"],
+    biz_given: ["Business given to (Igniter member)", "Business given to (GPBO member of another wing)"],
+    biz_received: ["Business received from (Igniter member)", "Business received from (GPBO member of another wing)"],
+  };
+
+  // "Who was the other person?" — an Igniter member, or a GPBO member of another wing (searched in the GPBO directory)
+  const partnerPicker = (segInside, segOutside, insideLabel, outsideLabel) => `
+    <div class="seg" id="f-scope"><button type="button" class="active" data-v="inside">${segInside}</button><button type="button" data-v="outside">${segOutside}</button></div>
+    <label class="f" id="f-inside"><span id="f-partner-l">${insideLabel} <em>*</em></span><select id="f-partner" required>${memberOptions()}</select></label>
+    <div id="f-outside" class="hidden">
+      <label class="f"><span id="f-outside-l">${outsideLabel} <em>*</em></span>
+        <input type="search" id="f-dsearch" placeholder="🔍 Type name, wing or company…" autocomplete="off"></label>
+      <div id="f-dresults" class="dir-results"></div>
+      <div id="f-dchosen" class="notice good hidden"></div>
+      <button type="button" class="btn ghost sm mb" id="f-manual-btn">Not in the list? Type the name</button>
+      <div id="f-manual" class="hidden"><div class="form-grid two">
+        <label class="f"><span>Name of the GPBO member <em>*</em></span><input type="text" id="f-pname" placeholder="Full name"></label>
+        <label class="f"><span>Their GPBO wing <em>*</em></span><input type="text" id="f-pwing" placeholder="Name of their wing"></label>
+      </div></div>
+    </div>`;
 
   async function buildForm(area, type) {
     const s = App.settings, today = App.todayISO();
@@ -333,15 +371,12 @@
     let challenges = [];
 
     if (type === "p2p") {
-      html = `${dateField("Date of meeting")}
-        <label class="f"><span>Member met <em>*</em></span><select id="f-partner" required>${memberOptions()}</select></label>
+      html = `${partnerPicker(`🏠 INSIDE wing (${esc(App.pointsText("p2p"))})`, `🌐 OUTSIDE wing (${esc(App.pointsText("p2p_outside"))})`,
+                              "Igniter member met", "GPBO member met (any other wing)")}
+        ${dateField("Date of meeting")}
         <label class="f"><span>Business discussion summary <em>*</em></span><textarea id="f-desc" placeholder="What did you discuss? Their business, requirements, ideal customers, how you can support each other…" required></textarea></label>
         <label class="f"><span>Notes (optional)</span><input type="text" id="f-notes"></label>
-        <div class="f"><span style="display:block;font-weight:600;font-size:.9rem;margin-bottom:5px">Photograph of the meeting <em style="color:var(--red);font-style:normal">*</em></span>
-          <div class="photo-drop"><input type="file" id="f-photo" accept="image/jpeg,image/png,image/webp" class="hidden">
-            <button type="button" class="btn ghost" id="f-photo-btn">📷 Take / Choose Photo</button>
-            <div class="small muted mt">JPG, PNG or WEBP. Large photos are automatically reduced (max 5 MB).</div>
-            <img id="f-preview" class="hidden" alt="Preview"></div></div>`;
+        ${photoPicker("photo", "Photograph of the meeting", true, "📷 Take / Choose Photo", "JPG, PNG or WEBP. Large photos are automatically reduced (max 5 MB).")}`;
     } else if (type === "new_member") {
       const newOnes = App.members.filter((m) => m.is_new && m.id !== App.profile.id);
       if (!newOnes.length) { area.innerHTML = `<div class="card"><h3>🌱 New Member Connection</h3><div class="notice warn">No members are marked as “new members” yet. The Admin marks new members in Admin → Members.</div></div>`; return; }
@@ -351,14 +386,14 @@
         <label class="f"><span>Notes (optional)</span><input type="text" id="f-notes"></label>`;
     } else if (type === "reference") {
       html = `<div class="seg" id="f-dir"><button type="button" class="active" data-v="ref_given">📤 I GAVE a reference</button><button type="button" data-v="ref_received">📥 I RECEIVED a reference</button></div>
+        ${partnerPicker("🏠 Igniter member", "🌐 Other GPBO wing member", PARTNER_LABELS.ref_given[0], PARTNER_LABELS.ref_given[1])}
         ${dateField()}
-        <label class="f"><span id="f-partner-l">Given to member</span><select id="f-partner" required>${memberOptions()}</select></label>
         <label class="f"><span>Reference details <em>*</em></span><textarea id="f-desc" placeholder="What is the requirement / opportunity?" required></textarea></label>
         <label class="f"><span>Customer / company name (if appropriate)</span><input type="text" id="f-customer"></label>
         <label class="f"><span>Notes (optional)</span><input type="text" id="f-notes"></label>`;
     } else if (type === "business") {
       html = `<div class="seg" id="f-dir"><button type="button" class="active" data-v="biz_given">💼 Business GIVEN</button><button type="button" data-v="biz_received">💰 Business RECEIVED</button></div>
-        <label class="f"><span id="f-partner-l">Business given to member</span><select id="f-partner" required>${memberOptions()}</select></label>
+        ${partnerPicker("🏠 Igniter member", "🌐 Other GPBO wing member", PARTNER_LABELS.biz_given[0], PARTNER_LABELS.biz_given[1])}
         <label class="f"><span>Amount in ₹ <em>*</em></span><input type="number" id="f-amount" inputmode="numeric" min="1" step="1" placeholder="e.g. 250000" required><small id="f-amt-pts">Points: 0</small></label>
         ${dateField()}
         <label class="f"><span>Description <em>*</em></span><textarea id="f-desc" placeholder="What was the business?" required></textarea></label>
@@ -383,10 +418,13 @@
         ${dateField("Date completed")}
         <label class="f"><span>How did you complete it? <em>*</em></span><textarea id="f-desc" placeholder="Give details so the Admin can verify (names, dates, etc.)" required></textarea></label>`;
     }
+    const needShot = s.require_app_screenshot !== false;
+    if (type !== "challenge") html += photoPicker("shot", "Screenshot of this entry in the GPBO app", needShot, "📱 Upload GPBO App Screenshot",
+      "Submit this entry in the GPBO app first, take a screenshot showing it, then upload that screenshot here. The Admin checks it before approving.");
     const t = TYPES.find((x) => x.t === type);
     area.innerHTML = `<form class="card" id="sub-form" novalidate>
         <h3>${t.icon} ${t.l}</h3>
-        <div class="notice small">${HELP[type]}</div>
+        <div class="notice small">${HELP[type]}${type === "business" ? ` <b>${esc(App.pointsText("biz_given"))}</b>.` : ""}</div>
         ${html}
         <div id="f-err" class="notice bad hidden"></div>
         <button class="btn green block lg" id="f-submit" type="submit">Submit for Approval</button>
@@ -399,10 +437,59 @@
     if (dir) App.$$("button", dir).forEach((b) => (b.onclick = () => {
       App.$$("button", dir).forEach((x) => x.classList.toggle("active", x === b));
       category = b.dataset.v;
-      const l = App.$("#f-partner-l", area);
-      if (l) l.textContent = { ref_given: "Given to member", ref_received: "Received from member", biz_given: "Business given to member", biz_received: "Business received from member" }[category];
+      const [inL, outL] = PARTNER_LABELS[category];
+      App.$("#f-partner-l", area).innerHTML = `${inL} <em>*</em>`;
+      App.$("#f-outside-l", area).innerHTML = `${outL} <em>*</em>`;
       updAmt();
     }));
+    let partnerScope = "inside";
+    const scopeSeg = App.$("#f-scope", area);
+    if (scopeSeg) App.$$("button", scopeSeg).forEach((b) => (b.onclick = () => {
+      App.$$("button", scopeSeg).forEach((x) => x.classList.toggle("active", x === b));
+      partnerScope = b.dataset.v;
+      App.$("#f-inside", area).classList.toggle("hidden", partnerScope === "outside");
+      App.$("#f-outside", area).classList.toggle("hidden", partnerScope !== "outside");
+      if (partnerScope === "outside") loadDirectory();
+    }));
+    // ---- GPBO directory search (outside wing: P2P, Reference, Business) ----
+    let directory = null, dirChoice = null, manual = false;
+    const dSearch = App.$("#f-dsearch", area), dResults = App.$("#f-dresults", area), dChosen = App.$("#f-dchosen", area);
+    const showResults = () => {
+      if (!directory || !dSearch) return;
+      const words = dSearch.value.toLowerCase().split(/\s+/).filter(Boolean);
+      if (!words.length) { dResults.innerHTML = `<div class="small muted">${directory.length ? `Start typing to search ${directory.length} GPBO members.` : "The GPBO directory is empty. Use “Not in the list? Type the name”."}</div>`; return; }
+      const hits = directory.filter((d) => { const s = `${d.full_name} ${d.wing} ${d.company || ""}`.toLowerCase(); return words.every((w) => s.includes(w)); }).slice(0, 30);
+      dResults.innerHTML = hits.length ? hits.map((d) => `<button type="button" class="dir-item" data-id="${d.id}"><b>${esc(d.full_name)}</b><span>${esc(d.wing)}${d.company ? " · " + esc(d.company) : ""}</span></button>`).join("")
+        : '<div class="small muted">No match. Check the spelling, or use “Not in the list? Type the name”.</div>';
+      App.$$(".dir-item", dResults).forEach((b) => (b.onclick = () => choose(directory.find((d) => String(d.id) === b.dataset.id))));
+    };
+    const choose = (d) => {
+      dirChoice = d;
+      dSearch.closest("label").classList.toggle("hidden", !!d);
+      dResults.classList.toggle("hidden", !!d);
+      dChosen.classList.toggle("hidden", !d);
+      if (d) {
+        dChosen.innerHTML = `✔ <b>${esc(d.full_name)}</b> · ${esc(d.wing)}${d.company ? " · " + esc(d.company) : ""} <button type="button" class="btn ghost sm" id="f-dchange">Change</button>`;
+        App.$("#f-dchange", dChosen).onclick = () => { choose(null); dSearch.focus(); };
+      } else showResults();
+    };
+    async function loadDirectory() {
+      if (directory || !dSearch) return;
+      dResults.innerHTML = App.loadingHTML;
+      try { directory = await App.cachedRpc("list_gpbo_directory", null, 300000); } catch (e) { directory = []; App.toast(App.errMsg(e), "bad"); }
+      showResults();
+    }
+    if (dSearch) {
+      dSearch.oninput = showResults;
+      App.$("#f-manual-btn", area).onclick = () => {
+        manual = !manual;
+        App.$("#f-manual", area).classList.toggle("hidden", !manual);
+        App.$("#f-manual-btn", area).textContent = manual ? "Search the GPBO list instead" : "Not in the list? Type the name";
+        dSearch.closest("label").classList.toggle("hidden", manual || !!dirChoice);
+        dResults.classList.toggle("hidden", manual || !!dirChoice);
+        dChosen.classList.toggle("hidden", manual || !dirChoice);
+      };
+    }
     const amt = App.$("#f-amount", area);
     const updAmt = () => { if (amt) App.$("#f-amt-pts", area).textContent = `Points: ${App.calcPoints(category, amt.value)} ${amt.value ? "(" + App.fmtINR(amt.value) + ")" : ""}`; };
     if (amt) amt.oninput = updAmt;
@@ -411,24 +498,36 @@
       const showCh = () => { const c = challenges.find((x) => String(x.id) === chSel.value); App.$("#f-ch-desc", area).innerHTML = c ? `<b>${esc(c.name)}</b>: ${esc(c.description || "")}${c.start_date ? `<br><span class="small">${App.fmtDate(c.start_date)} – ${App.fmtDate(c.end_date)}</span>` : ""}` : ""; };
       chSel.onchange = showCh; showCh();
     }
-    let photoBlob = null;
-    const photoIn = App.$("#f-photo", area);
-    if (photoIn) {
-      App.$("#f-photo-btn", area).onclick = () => photoIn.click();
-      photoIn.onchange = async () => {
-        const f = photoIn.files[0];
-        photoBlob = null;
-        const prev = App.$("#f-preview", area);
+    // photo pickers (meeting photo, GPBO app screenshot)
+    const blobs = {};
+    const busy = {};   // photos still being prepared
+    App.$$(".photo-drop[data-key]", area).forEach((box) => {
+      const key = box.dataset.key, input = App.$("input[type=file]", box), btn = App.$("button", box), prev = App.$("img", box);
+      const label = btn.textContent;
+      btn.onclick = () => input.click();
+      input.onchange = async () => {
+        const f = input.files[0];
+        blobs[key] = null;
         prev.classList.add("hidden");
         if (!f) return;
+        btn.disabled = true; btn.textContent = "Processing…";
+        busy[key] = new Promise((done) => (busy[key + "_done"] = done));
         try {
-          photoBlob = await App.preparePhoto(f);
-          prev.src = URL.createObjectURL(photoBlob);
+          blobs[key] = await App.preparePhoto(f, key === "shot" ? 2000 : 1600);
+          prev.src = URL.createObjectURL(blobs[key]);
           prev.classList.remove("hidden");
-          App.$("#f-photo-btn", area).textContent = "📷 Change Photo";
-        } catch (e) { App.toast(App.errMsg(e), "bad"); photoIn.value = ""; }
+          btn.textContent = "🔄 Change";
+        } catch (e) { App.toast(App.errMsg(e), "bad"); input.value = ""; btn.textContent = label; }
+        btn.disabled = false;
+        busy[key + "_done"](); delete busy[key]; delete busy[key + "_done"];
       };
-    }
+    });
+    const uploadBlob = async (key, folder) => {
+      const path = `${App.profile.id}/${folder}/${Date.now()}_${App.rand()}.jpg`;
+      const up = await App.sb.storage.from("proofs").upload(path, blobs[key], { contentType: "image/jpeg", upsert: false });
+      if (up.error) throw up.error;
+      return path;
+    };
 
     App.$("#sub-form", area).onsubmit = async (e) => {
       e.preventDefault();
@@ -440,17 +539,33 @@
       if (!date) return fail("Please choose the date.");
       btn.disabled = true; btn.textContent = "Submitting…";
       try {
+        // wait if a photo is still being prepared
+        await Promise.all(Object.keys(busy).filter((k) => !k.endsWith("_done")).map((k) => busy[k]));
         const uid = App.profile.id;
+        const needShot = type !== "challenge" && s.require_app_screenshot !== false;
+        const checkShot = () => { if (needShot && !blobs.shot) throw new Error("Please upload the screenshot of this entry from the GPBO app."); };
         if (type === "visitor") {
           if (!val("v-name")) throw new Error("Please enter the visitor name.");
           if (val("v-mobile").replace(/\D/g, "").length < 10) throw new Error("Please enter a valid 10-digit mobile number.");
+          checkShot();
           await App.rpc("submit_visitor", {
             p_visitor_name: val("v-name"), p_company: val("v-company"), p_mobile: val("v-mobile"),
             p_business_category: val("v-cat"), p_visit_date: date, p_event_name: val("v-event"), p_notes: val("f-notes"),
+            p_app_screenshot: blobs.shot ? await uploadBlob("shot", "gpbo") : null,
           });
         } else {
           const args = { p_category: category, p_txn_date: date, p_description: val("f-desc"), p_notes: val("f-notes") || null };
-          if (type !== "challenge") {
+          if (["p2p", "reference", "business"].includes(type) && partnerScope === "outside") {
+            args.p_p2p_scope = "outside";
+            if (!manual && dirChoice) args.p_gpbo_member_id = dirChoice.id;
+            else if (!manual) throw new Error("Please search and select the GPBO member (or tap “Not in the list? Type the name”).");
+            else {
+              args.p_partner_name = val("f-pname");
+              args.p_partner_wing = val("f-pwing");
+              if (args.p_partner_name.length < 2) throw new Error("Please enter the name of the GPBO member.");
+              if (args.p_partner_wing.length < 2) throw new Error("Please enter their GPBO wing.");
+            }
+          } else if (type !== "challenge") {
             args.p_partner_id = val("f-partner");
             if (!args.p_partner_id) throw new Error("Please choose the member.");
           }
@@ -473,13 +588,12 @@
           }
           if (type === "challenge") { args.p_challenge_id = Number(val("f-ch")); args.p_notes = null; }
           if (type === "p2p") {
-            if (!photoBlob) throw new Error("Please add a photograph of the P2P meeting.");
+            if (!blobs.photo) throw new Error("Please add a photograph of the P2P meeting.");
             if (args.p_description.length < 10) throw new Error("Please write a little more in the discussion summary (at least 10 characters).");
-            const path = `${uid}/p2p/${Date.now()}_${App.rand()}.jpg`;
-            const up = await App.sb.storage.from("proofs").upload(path, photoBlob, { contentType: "image/jpeg", upsert: false });
-            if (up.error) throw up.error;
-            args.p_photo_path = path;
           }
+          checkShot();
+          if (type === "p2p") args.p_photo_path = await uploadBlob("photo", "p2p");
+          if (blobs.shot) args.p_app_screenshot = await uploadBlob("shot", "gpbo");
           await App.rpc("submit_activity", args);
         }
         area.innerHTML = `<div class="card center"><div style="font-size:3rem">✅</div><h2>Submitted!</h2>
@@ -510,9 +624,11 @@
     if (a.attendance) bits.push(`${a.attendance} attendance`);
     if (a.activities) bits.push(`${a.activities} activities`);
     if (a.challenges) bits.push(`${a.challenges} challenge${a.challenges > 1 ? "s" : ""}`);
+    if (a.group_organized) bits.push(`${a.group_organized} group mtg organized`);
+    if (a.group_attended) bits.push(`${a.group_attended} group mtg attended`);
     return bits.join(" · ");
   };
-  App.lbAchievements = (r) => App.achievementsText({ p2p: r.p2p, ref_given: r.ref_given, ref_received: r.ref_received, biz_given_amount: r.biz_given_amount, biz_received_amount: r.biz_received_amount, visitors: r.visitors, inductions: r.inductions, new_member: r.new_member, attendance: r.attendance, activities: r.activities, challenges: r.challenges });
+  App.lbAchievements = (r) => App.achievementsText({ p2p: r.p2p, ref_given: r.ref_given, ref_received: r.ref_received, biz_given_amount: r.biz_given_amount, biz_received_amount: r.biz_received_amount, visitors: r.visitors, inductions: r.inductions, new_member: r.new_member, attendance: r.attendance, activities: r.activities, challenges: r.challenges, group_organized: r.group_organized, group_attended: r.group_attended });
 
   App.renderFinalResult = (finals, awards) => `
     <div class="final-banner"><div class="l1">IGNITER BUSINESS &amp; P2P LEAGUE</div><div class="l2">${App.weeks.length}-WEEK FINAL RESULT</div></div>
@@ -536,9 +652,9 @@
     if (App.stale(token)) return;
     const cw = App.currentWeek();
     const live = {};
-    for (const w of App.weeks) {
-      if (!w.locked && w.start_date <= App.todayISO()) live[w.week_no] = (await App.rpc("get_leaderboard", { p_week: w.week_no })).filter((r) => r.total_points > 0).slice(0, 3);
-    }
+    const liveWeeks = App.weeks.filter((w) => !w.locked && w.start_date <= App.todayISO());
+    const liveData = await Promise.all(liveWeeks.map((w) => App.cachedRpc("get_leaderboard", { p_week: w.week_no })));
+    liveWeeks.forEach((w, i) => (live[w.week_no] = liveData[i].filter((r) => r.total_points > 0).slice(0, 3)));
     if (App.stale(token)) return;
     const s = App.settings;
     el.innerHTML = `
@@ -576,7 +692,7 @@
     if (!App.isAdmin()) mine = await App.q(App.sb.from("transactions").select("id,challenge_id,status").eq("member_id", App.profile.id).eq("category", "challenge"));
     if (App.stale(token)) return;
     el.innerHTML = `<h2>⚡ Special Challenges</h2>
-      <p class="small muted">Complete a challenge to earn bonus points (10 – 30). ${App.settings.allow_challenge_claims ? "Tap “I completed this” to claim it — the Admin will verify." : "The Admin awards challenge points directly."}</p>
+      <p class="small muted">Complete a challenge to earn bonus points (up to 150). ${App.settings.allow_challenge_claims ? "Tap “I completed this” to claim it — the Admin will verify." : "The Admin awards challenge points directly."}</p>
       ${list.length ? list.map((c) => {
         const my = mine.filter((m) => m.challenge_id === c.id).sort((a, b) => (a.status === "rejected") - (b.status === "rejected"))[0];
         return `<div class="card"><div class="card-title"><h3>⚡ ${esc(c.name)}</h3><span class="tag approved" style="font-size:.9rem">+${c.points} pts</span></div>
@@ -623,6 +739,7 @@
         const { error } = await App.sb.auth.updateUser({ password: a });
         if (error) throw error;
         show("✔ Password changed. Use the new password next time you log in.", "good");
+        try { await App.rpc("mark_password_changed"); await App.reloadProfile(); } catch (_) { /* reminder only */ }
         App.$("#pw1", el).value = App.$("#pw2", el).value = "";
       } catch (ex) { show(App.errMsg(ex), "bad"); }
       btn.disabled = false; btn.textContent = "Change Password";

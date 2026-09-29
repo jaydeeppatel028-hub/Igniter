@@ -25,9 +25,16 @@
     attendance:   { icon: "✅", label: "Meeting Attendance" },
     activity:     { icon: "🏭", label: "Activity Participation" },
     challenge:    { icon: "⚡", label: "Special Challenge" },
+    group_organize: { icon: "👥", label: "Group Meeting Organized" },
+    group_attend:   { icon: "🙌", label: "Group Meeting Attended" },
   };
   App.catLabel = (c) => (App.rulesMap && App.rulesMap[c] && App.rulesMap[c].label) || (App.CATS[c] && App.CATS[c].label) || c;
   App.catIcon = (c) => (App.CATS[c] && App.CATS[c].icon) || "•";
+  // Label for one entry (P2P shows Inside / Outside wing)
+  App.txnLabel = (t) => {
+    if (t.category === "p2p" && t.p2p_scope === "outside") return App.catLabel("p2p_outside");
+    return App.catLabel(t.category) + (t.p2p_scope === "outside" ? " – Outside Wing" : "");
+  };
 
   // ------------------------------------------------------------------
   // Small helpers
@@ -99,6 +106,22 @@
     return res.data;
   };
   App.rpc = (fn, args) => App.q(App.sb.rpc(fn, args || {}));
+
+  // Speed: remember results for a short time so moving between pages is instant.
+  // (Admin actions call App.clearCache() so changes show immediately.)
+  const memo = {};
+  App.cachedRpc = (fn, args, ttlMs) => {
+    const key = fn + JSON.stringify(args || {});
+    const hit = memo[key];
+    if (hit && Date.now() - hit.t < (ttlMs || 30000)) return hit.p;
+    const p = App.rpc(fn, args);
+    memo[key] = { t: Date.now(), p };
+    p.catch(() => delete memo[key]);
+    return p;
+  };
+  App.clearCache = () => { Object.keys(memo).forEach((k) => delete memo[k]); };
+
+  App.FOOTER = "This website is designed and developed by Jaydeep Patel.";
 
   // Call the secure admin Edge Function
   App.adminFn = async (action, payload) => {
@@ -324,13 +347,16 @@
   App.pointsText = (code) => {
     const r = App.rulesMap && App.rulesMap[code];
     if (!r) return "";
-    if (r.unit_amount) return `${r.points} pt per ${App.fmtINR(r.unit_amount)}`;
+    if (r.unit_amount) return `${r.points} pt per ${App.fmtINR(r.unit_amount)}${r.max_points ? ` (max ${r.max_points} pts in the league)` : ""}`;
     return `+${r.points} pts`;
   };
   App.calcPoints = (code, amount) => {
     const r = App.rulesMap && App.rulesMap[code];
     if (!r) return 0;
-    if (r.unit_amount) return Math.floor((Number(amount) || 0) / Number(r.unit_amount)) * r.points;
+    if (r.unit_amount) {
+      const pts = Math.floor((Number(amount) || 0) / Number(r.unit_amount)) * r.points;
+      return r.max_points ? Math.min(pts, r.max_points) : pts;
+    }
     return r.points;
   };
 
@@ -372,9 +398,9 @@
     app.innerHTML = `
       <header class="topbar">
         <a class="brand" href="#/home" aria-label="Home">
-          <img src="assets/igniter-logo.png" alt="IGNITER Ahmedabad">
+          <img src="igniter-logo.png" alt="IGNITER Ahmedabad">
           <span class="divider"></span>
-          <img class="gpbo" src="assets/gpbo-logo.png" alt="Sardardham GPBO Network">
+          <img class="gpbo" src="gpbo-logo.png" alt="Sardardham GPBO Network">
         </a>
         <nav class="topnav">${items.map((n) => `<a href="#/${n.r}" data-nav="${n.r}">${n.l}${n.r === "admin" ? badge : ""}</a>`).join("")}</nav>
         <button class="icon-btn menu-btn" id="menu-btn" aria-label="Menu">☰</button>
@@ -382,6 +408,7 @@
       ${s.test_mode ? '<div class="test-banner">TEST MODE — sample data may be visible. (Admin can switch this off in Settings.)</div>' : ""}
       ${s.announcement ? `<div class="announce">${esc(s.announcement)}</div>` : ""}
       <main id="view"></main>
+      <footer class="site-footer">${esc(App.FOOTER)}</footer>
       <nav class="bottomnav">
         <a href="#/home" data-nav="home"><span class="ico">🏠</span>Home</a>
         <a href="#/leaderboard" data-nav="leaderboard"><span class="ico">🏆</span>Board</a>
@@ -441,10 +468,10 @@
   // ------------------------------------------------------------------
   function renderNotConfigured() {
     document.getElementById("app").innerHTML = `<div class="login-page"><div class="login-box card">
-      <div class="login-logos"><img src="assets/igniter-logo.png" alt="IGNITER"><img class="gpbo" src="assets/gpbo-logo.png" alt="GPBO"></div>
+      <div class="login-logos"><img src="igniter-logo.png" alt="IGNITER"><img class="gpbo" src="gpbo-logo.png" alt="GPBO"></div>
       <h2>Almost ready!</h2>
       <p>The website is not connected to Supabase yet.</p>
-      <p>Open the file <b>js/config.js</b> and paste your <b>Project URL</b> and <b>anon public key</b>. (See the setup guide, Step 10–11.)</p>
+      <p>Open the file <b>config.js</b> and paste your <b>Project URL</b> and <b>anon public key</b>. (See the setup guide, Step 10–11.)</p>
       ${typeof window.supabase === "undefined" ? '<div class="notice bad">The Supabase library could not load. Check your internet connection.</div>' : ""}
     </div></div>`;
   }
@@ -452,7 +479,7 @@
   function renderLogin(message) {
     document.getElementById("app").innerHTML = `
       <div class="login-page"><div class="login-box">
-        <div class="login-logos"><img src="assets/igniter-logo.png" alt="IGNITER Ahmedabad"><img class="gpbo" src="assets/gpbo-logo.png" alt="Sardardham GPBO Network"></div>
+        <div class="login-logos"><img src="igniter-logo.png" alt="IGNITER Ahmedabad"><img class="gpbo" src="gpbo-logo.png" alt="Sardardham GPBO Network"></div>
         <div class="league-title"><div class="l1">IGNITER</div><div class="l2">BUSINESS &amp; P2P LEAGUE</div>
           <div class="tagline">CONNECT MORE • REFER MORE • SUPPORT MORE • GROW TOGETHER</div></div>
         <form class="card" id="login-form" autocomplete="on">
@@ -466,6 +493,7 @@
           <button class="btn block lg" id="lg-btn" type="submit">Login</button>
           <p class="small muted center mt">Forgot password? Please contact the League Admin.<br>Admin uses the same login screen.</p>
         </form>
+        <p class="login-footer">${esc(App.FOOTER)}</p>
       </div></div>`;
     App.$("#lg-eye").onclick = () => { const p = App.$("#lg-pass"); p.type = p.type === "password" ? "text" : "password"; };
     App.$("#login-form").onsubmit = async (e) => {
@@ -492,11 +520,14 @@
 
   async function afterLogin() {
     const uid = App.session.user.id;
+    // profile + league data load at the same time (faster)
+    const baseP = App.loadBase().then(() => null, (e) => e);
     const prof = await App.q(App.sb.from("profiles").select("*").eq("id", uid).maybeSingle());
     if (!prof) { await App.sb.auth.signOut(); App.session = null; return renderLogin("Your profile was not found. Please contact the League Admin."); }
     if (!prof.is_active) { await App.sb.auth.signOut(); App.session = null; return renderLogin("Your account is disabled. Please contact the League Admin."); }
     App.profile = prof;
-    await App.loadBase();
+    const baseErr = await baseP;
+    if (baseErr) throw baseErr;
     if (!location.hash || location.hash === "#/" || location.hash === "#/login") location.hash = "#/home";
     App.$("#view") && App.$("#view").remove();
     renderShell();
@@ -510,6 +541,7 @@
   App.logout = async () => {
     try { await App.sb.auth.signOut(); } catch (_) { /* ignore */ }
     App.session = null; App.profile = null;
+    App.clearCache();
     location.hash = "#/login";
     renderLogin();
   };
